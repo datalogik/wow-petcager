@@ -1,0 +1,7 @@
+## Interface: 120001
+## Title: Pet Cager
+## Notes: Cages tradeable battle pets in batches for auction house selling, with auto-cage and uncage features.
+## Author: datalogik
+## Version: 2.0.0
+
+PetCager.lua
