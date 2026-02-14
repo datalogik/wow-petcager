@@ -179,7 +179,7 @@ end
 -- Main Frame
 ---------------------------------------------------------------------------
 local frame = CreateFrame("Frame", "PetCagerFrame", UIParent, "BasicFrameTemplateWithInset")
-frame:SetSize(500, 550)
+frame:SetSize(500, 575)
 frame:SetPoint("CENTER")
 frame:SetMovable(true)
 frame:EnableMouse(true)
@@ -215,7 +215,7 @@ content:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -10, 10)
 ---------------------------------------------------------------------------
 -- Filter panel (always visible)
 ---------------------------------------------------------------------------
-local FILTER_PANEL_HEIGHT = 175
+local FILTER_PANEL_HEIGHT = 200
 local filterPanel = CreateFrame("Frame", nil, content)
 filterPanel:SetPoint("TOPLEFT", content, "TOPLEFT", 2, -2)
 filterPanel:SetPoint("RIGHT", content, "RIGHT", -2, 0)
@@ -258,17 +258,16 @@ levelMaxInput:SetPoint("LEFT", levelMinInput, "RIGHT", 10, 0)
 local keepCountInput = CreateNumberInput(filterPanel, "Keep per species:", 40, filters.keepCount, function(val)
     filters.keepCount = math.max(0, val)
 end)
-keepCountInput:SetPoint("LEFT", levelMaxInput, "RIGHT", 16, 0)
+keepCountInput:SetPoint("TOPLEFT", levelLabel, "BOTTOMLEFT", 0, -8)
 
--- Min owned on same row as level inputs
 local minDupeInput = CreateNumberInput(filterPanel, "Min owned:", 40, filters.minDuplicates, function(val)
     filters.minDuplicates = math.max(1, val)
 end)
-minDupeInput:SetPoint("LEFT", keepCountInput, "RIGHT", 16, 0)
+minDupeInput:SetPoint("LEFT", keepCountInput, "RIGHT", 50, 0)
 
 -- Pet Families
 local famHeader = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-famHeader:SetPoint("TOPLEFT", levelLabel, "BOTTOMLEFT", 0, -8)
+famHeader:SetPoint("TOPLEFT", keepCountInput, "BOTTOMLEFT", 0, -4)
 famHeader:SetText("|cffffd100Pet Families:|r")
 
 for i = 1, #FAMILY_NAMES do
