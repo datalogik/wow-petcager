@@ -1,4 +1,4 @@
-## Interface: 120001
+## Interface: 120100
 ## Title: Pet Cager
 ## Notes: Cages tradeable battle pets in batches for auction house selling, with auto-cage and uncage features.
 ## Author: datalogik
