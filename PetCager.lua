@@ -1,6 +1,6 @@
 local CAGE_DELAY = 0.2
-local ROW_HEIGHT = 20
-local LIST_ROW_COUNT = 15
+local ROW_HEIGHT = 22
+local LIST_ROW_COUNT = 10
 local NUM_BAG_SLOTS = 5 -- backpack (0) + 4 bags (1-4)
 
 ---------------------------------------------------------------------------
@@ -9,14 +9,18 @@ local NUM_BAG_SLOTS = 5 -- backpack (0) + 4 bags (1-4)
 local scannedPets = {}
 local isCaging = false
 
-local continueCagingAfterScan = false
-local isCageLooping = false
-local sessionCagedTotal = 0
+local scanDirty = true
+local batchToken = 0
+local StopCaging
+local MarkFiltersChanged
+local controls = {}
 local sortColumn = "level"   -- current sort key
 local sortAscending = false  -- default: descending
 
 -- Filter defaults
 local filters = {
+    protectNamed = true,
+    search = "",
     keepCount = 1,
     minDuplicates = 2,
     levelMin = 1,
@@ -39,7 +43,7 @@ local QUALITY_COLORS = {
     { 0.62, 0.62, 0.62 },
     { 1.00, 1.00, 1.00 },
     { 0.12, 1.00, 0.00 },
-    { 0.00, 0.44, 0.87 },
+    { 0.25, 0.65, 1.00 },
 }
 
 local FAMILY_NAMES = {
@@ -51,6 +55,12 @@ local SOURCE_NAMES = {
     "Drop", "Quest", "Vendor", "Profession", "Pet Battle",
     "Achievement", "World Event", "Promotion", "Trading Card", "In-Game Shop", "Discovery",
 }
+
+-- Use Blizzard's localized labels and include newly exposed source filters.
+for i = 1, C_PetJournal.GetNumPetSources() do
+    SOURCE_NAMES[i] = _G["BATTLE_PET_SOURCE_" .. i] or SOURCE_NAMES[i] or ("Source " .. i)
+end
+local extraSourceHeight = math.max(0, math.ceil(#SOURCE_NAMES / 4) - 3) * 24
 
 ---------------------------------------------------------------------------
 -- Helpers
@@ -72,7 +82,11 @@ local function CreateSmallCheck(parent, label, checked, onClick, colorR, colorG,
     if colorR then
         cb.label:SetTextColor(colorR, colorG, colorB)
     end
-    cb:SetScript("OnClick", onClick)
+    cb:SetScript("OnClick", function(self)
+        onClick(self)
+        if MarkFiltersChanged then MarkFiltersChanged() end
+    end)
+    controls[#controls + 1] = cb
     return cb
 end
 
@@ -95,9 +109,12 @@ local function CreateNumberInput(parent, labelText, width, initialValue, onChang
     box:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
     box:SetScript("OnEditFocusLost", function(self)
         local val = self:GetNumber()
-        onChanged(val)
+        local normalized = onChanged(val)
+        self:SetNumber(normalized or val)
+        if MarkFiltersChanged then MarkFiltersChanged() end
     end)
 
+    controls[#controls + 1] = box
     container.box = box
     return container
 end
@@ -108,8 +125,8 @@ end
 local function GetFreeBagSlots()
     local free = 0
     for bag = 0, NUM_BAG_SLOTS - 1 do
-        local freeSlots = C_Container.GetContainerNumFreeSlots(bag)
-        free = free + (freeSlots or 0)
+        local freeSlots, bagFamily = C_Container.GetContainerNumFreeSlots(bag)
+        if bagFamily == 0 then free = free + (freeSlots or 0) end
     end
     return free
 end
@@ -179,7 +196,10 @@ end
 -- Main Frame
 ---------------------------------------------------------------------------
 local frame = CreateFrame("Frame", "PetCagerFrame", UIParent, "BasicFrameTemplateWithInset")
-frame:SetSize(500, 575)
+frame:SetSize(640, 760 + extraSourceHeight)
+frame:SetClampedToScreen(true)
+frame:SetScale(math.min(1, (UIParent:GetHeight() - 40) / (760 + extraSourceHeight), (UIParent:GetWidth() - 40) / 640))
+table.insert(UISpecialFrames, "PetCagerFrame")
 frame:SetPoint("CENTER")
 frame:SetMovable(true)
 frame:EnableMouse(true)
@@ -197,12 +217,12 @@ frame.title:SetText("Pet Cager")
 -- Status / progress
 local statusText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 statusText:SetPoint("TOP", frame, "TOP", 0, -40)
-statusText:SetWidth(460)
-statusText:SetText("Scanning pets...")
+statusText:SetWidth(600)
+statusText:SetText("Scan your collection, review the list, then cage selected pets.")
 
 local progressText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 progressText:SetPoint("TOP", statusText, "BOTTOM", 0, -4)
-progressText:SetWidth(460)
+progressText:SetWidth(600)
 progressText:SetText("")
 
 ---------------------------------------------------------------------------
@@ -215,7 +235,7 @@ content:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -10, 10)
 ---------------------------------------------------------------------------
 -- Filter panel (always visible)
 ---------------------------------------------------------------------------
-local FILTER_PANEL_HEIGHT = 200
+local FILTER_PANEL_HEIGHT = 310 + extraSourceHeight
 local filterPanel = CreateFrame("Frame", nil, content)
 filterPanel:SetPoint("TOPLEFT", content, "TOPLEFT", 2, -2)
 filterPanel:SetPoint("RIGHT", content, "RIGHT", -2, 0)
@@ -224,7 +244,7 @@ filterPanel:SetHeight(FILTER_PANEL_HEIGHT)
 -- Quality row
 local qualChecks = {}
 local qualLabel = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-qualLabel:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 0, 0)
+qualLabel:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 0, -34)
 qualLabel:SetText("|cffffd100Quality:|r")
 
 for i = 1, 4 do
@@ -246,22 +266,26 @@ levelLabel:SetPoint("TOPLEFT", qualLabel, "BOTTOMLEFT", 0, -8)
 levelLabel:SetText("|cffffd100Level:|r")
 
 local levelMinInput = CreateNumberInput(filterPanel, "Min:", 40, filters.levelMin, function(val)
-    filters.levelMin = math.max(1, math.min(val, 25))
+    filters.levelMin = math.max(1, math.min(val, filters.levelMax))
+    return filters.levelMin
 end)
 levelMinInput:SetPoint("LEFT", levelLabel, "RIGHT", 6, 0)
 
 local levelMaxInput = CreateNumberInput(filterPanel, "Max:", 40, filters.levelMax, function(val)
-    filters.levelMax = math.max(1, math.min(val, 25))
+    filters.levelMax = math.max(filters.levelMin, math.min(val, 25))
+    return filters.levelMax
 end)
 levelMaxInput:SetPoint("LEFT", levelMinInput, "RIGHT", 10, 0)
 
 local keepCountInput = CreateNumberInput(filterPanel, "Keep per species:", 40, filters.keepCount, function(val)
-    filters.keepCount = math.max(0, val)
+    filters.keepCount = math.max(0, math.min(999, val))
+    return filters.keepCount
 end)
 keepCountInput:SetPoint("TOPLEFT", levelLabel, "BOTTOMLEFT", 0, -8)
 
 local minDupeInput = CreateNumberInput(filterPanel, "Min owned:", 40, filters.minDuplicates, function(val)
-    filters.minDuplicates = math.max(1, val)
+    filters.minDuplicates = math.max(1, math.min(999, val))
+    return filters.minDuplicates
 end)
 minDupeInput:SetPoint("LEFT", keepCountInput, "RIGHT", 50, 0)
 
@@ -283,11 +307,15 @@ famSelAll.text:SetPoint("LEFT")
 famSelAll.text:SetText("|cff888888[All / None]|r")
 famSelAll.allSelected = true
 famSelAll:SetScript("OnClick", function(self)
-    self.allSelected = not self.allSelected
+    self.allSelected = false
+    for _, check in ipairs(famChecks) do
+        if not check:GetChecked() then self.allSelected = true; break end
+    end
     for i = 1, #FAMILY_NAMES do
         filters.families[i] = self.allSelected
         famChecks[i]:SetChecked(self.allSelected)
     end
+    MarkFiltersChanged()
 end)
 
 for i = 1, #FAMILY_NAMES do
@@ -295,7 +323,7 @@ for i = 1, #FAMILY_NAMES do
         function(self) filters.families[i] = self:GetChecked() end)
     local col = (i - 1) % 5
     local row = math.floor((i - 1) / 5)
-    cb:SetPoint("TOPLEFT", famHeader, "BOTTOMLEFT", col * 92, -2 - (row * 24))
+    cb:SetPoint("TOPLEFT", famHeader, "BOTTOMLEFT", col * 120, -2 - (row * 24))
     famChecks[i] = cb
 end
 
@@ -317,11 +345,15 @@ srcSelAll.text:SetPoint("LEFT")
 srcSelAll.text:SetText("|cff888888[All / None]|r")
 srcSelAll.allSelected = true
 srcSelAll:SetScript("OnClick", function(self)
-    self.allSelected = not self.allSelected
+    self.allSelected = false
+    for _, check in ipairs(srcChecks) do
+        if not check:GetChecked() then self.allSelected = true; break end
+    end
     for i = 1, #SOURCE_NAMES do
         filters.sources[i] = self.allSelected
         srcChecks[i]:SetChecked(self.allSelected)
     end
+    MarkFiltersChanged()
 end)
 
 for i = 1, #SOURCE_NAMES do
@@ -329,7 +361,7 @@ for i = 1, #SOURCE_NAMES do
         function(self) filters.sources[i] = self:GetChecked() end)
     local col = (i - 1) % 4
     local row = math.floor((i - 1) / 4)
-    cb:SetPoint("TOPLEFT", srcHeader, "BOTTOMLEFT", col * 112, -2 - (row * 24))
+    cb:SetPoint("TOPLEFT", srcHeader, "BOTTOMLEFT", col * 150, -2 - (row * 24))
     srcChecks[i] = cb
 end
 
@@ -356,7 +388,7 @@ listSelNone:SetHighlightFontObject("GameFontHighlightSmall")
 
 -- Column headers (clickable for sorting)
 local colHeaderFrame = CreateFrame("Frame", nil, content)
-colHeaderFrame:SetSize(450, 16)
+colHeaderFrame:SetSize(590, 20)
 colHeaderFrame:SetPoint("TOPLEFT", listHeader, "BOTTOMLEFT", 0, -2)
 
 local colCheck = colHeaderFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -390,8 +422,15 @@ local function CreateSortableColumn(parent, label, sortKey, xOffset, width)
 
     btn:SetScript("OnEnter", function(self)
         self.label:SetTextColor(1, 1, 0.8)
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:SetText("Sort by " .. self.baseLabel)
+        if sortColumn == self.sortKey then
+            GameTooltip:AddLine(sortAscending and "Ascending (+). Click to reverse." or "Descending (-). Click to reverse.", 1, 1, 1)
+        end
+        GameTooltip:Show()
     end)
     btn:SetScript("OnLeave", function(self)
+        GameTooltip:Hide()
         if sortColumn == self.sortKey then
             self.label:SetTextColor(1, 0.82, 0)
         else
@@ -402,19 +441,21 @@ local function CreateSortableColumn(parent, label, sortKey, xOffset, width)
     return btn
 end
 
-local colName    = CreateSortableColumn(colHeaderFrame, "Name",    "name",    30,  195)
-local colLevel   = CreateSortableColumn(colHeaderFrame, "Lv",      "level",   230, 24)
-local colOwned   = CreateSortableColumn(colHeaderFrame, "Owned",   "owned",   256, 40)
-local colQuality = CreateSortableColumn(colHeaderFrame, "Quality", "quality", 300, 65)
-local colFamily  = CreateSortableColumn(colHeaderFrame, "Family",  "family",  370, 70)
+local colName    = CreateSortableColumn(colHeaderFrame, "Name",    "name",    30,  295)
+local colLevel   = CreateSortableColumn(colHeaderFrame, "Lv",      "level",   330, 44)
+local colOwned   = CreateSortableColumn(colHeaderFrame, "Owned",   "owned",   376, 50)
+local colQuality = CreateSortableColumn(colHeaderFrame, "Quality", "quality", 430, 75)
+local colFamily  = CreateSortableColumn(colHeaderFrame, "Family",  "family",  510, 80)
 
 local sortableColumns = { colName, colLevel, colOwned, colQuality, colFamily }
 
 UpdateColumnHeaders = function()
     for _, col in ipairs(sortableColumns) do
         if sortColumn == col.sortKey then
+            col.label:SetText(col.baseLabel .. (sortAscending and " +" or " -"))
             col.label:SetTextColor(1, 0.82, 0)
         else
+            col.label:SetText(col.baseLabel)
             col.label:SetTextColor(0.8, 0.8, 0.6)
         end
     end
@@ -441,7 +482,7 @@ local rowFrames = {}
 
 local function CreateRow(index)
     local row = CreateFrame("Frame", nil, scrollChild)
-    row:SetSize(430, ROW_HEIGHT)
+    row:SetSize(590, ROW_HEIGHT)
     row:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 0, -((index - 1) * ROW_HEIGHT))
 
     row.bg = row:CreateTexture(nil, "BACKGROUND")
@@ -462,33 +503,46 @@ local function CreateRow(index)
 
     row.nameText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     row.nameText:SetPoint("LEFT", row, "LEFT", 28, 0)
-    row.nameText:SetWidth(195)
+    row.nameText:SetWidth(295)
     row.nameText:SetJustifyH("LEFT")
     row.nameText:SetWordWrap(false)
 
     row.levelText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    row.levelText:SetPoint("LEFT", row, "LEFT", 228, 0)
+    row.levelText:SetPoint("LEFT", row, "LEFT", 328, 0)
     row.levelText:SetWidth(26)
     row.levelText:SetJustifyH("CENTER")
 
     row.ownedText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    row.ownedText:SetPoint("LEFT", row, "LEFT", 256, 0)
+    row.ownedText:SetPoint("LEFT", row, "LEFT", 374, 0)
     row.ownedText:SetWidth(38)
     row.ownedText:SetJustifyH("CENTER")
 
     row.qualityText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    row.qualityText:SetPoint("LEFT", row, "LEFT", 298, 0)
+    row.qualityText:SetPoint("LEFT", row, "LEFT", 428, 0)
     row.qualityText:SetWidth(65)
     row.qualityText:SetJustifyH("LEFT")
 
     row.familyText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    row.familyText:SetPoint("LEFT", row, "LEFT", 368, 0)
+    row.familyText:SetPoint("LEFT", row, "LEFT", 508, 0)
     row.familyText:SetWidth(70)
     row.familyText:SetJustifyH("LEFT")
 
+    row:EnableMouse(true)
+    row:SetScript("OnEnter", function(self)
+        local pet = scannedPets[self.petIndex]
+        if not pet then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText(pet.name)
+        GameTooltip:AddLine(string.format("Level %d • %s • %d owned", pet.level, QUALITY_NAMES[pet.rarity] or "?", pet.owned), 1, 1, 1)
+        GameTooltip:AddLine(string.format("Health %d   Power %d   Speed %d", pet.health, pet.power, pet.speed), 1, 1, 1)
+        if pet.sourceText then GameTooltip:AddLine(pet.sourceText, 0.8, 0.8, 0.8, true) end
+        GameTooltip:Show()
+    end)
+    row:SetScript("OnLeave", function() GameTooltip:Hide() end)
     row.petIndex = nil
 
     row.check:SetScript("OnClick", function(self)
+        if isCaging then return end
         if row.petIndex and scannedPets[row.petIndex] then
             scannedPets[row.petIndex].selected = self:GetChecked()
             UpdateSelectionCount()
@@ -518,7 +572,7 @@ stopBtn:Disable()
 
 local warnText = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 warnText:SetPoint("TOPLEFT", scanBtn, "BOTTOMLEFT", 0, -4)
-warnText:SetWidth(460)
+warnText:SetWidth(600)
 warnText:SetTextColor(1, 0.8, 0)
 warnText:SetText("")
 
@@ -573,6 +627,16 @@ end
 ---------------------------------------------------------------------------
 CheckBagSpace = function()
     if isCaging then return end
+    if scanDirty then
+        cageBtn:Disable()
+        warnText:SetText("Scan Pets to refresh the preview before caging.")
+        return
+    end
+    if InCombatLockdown() then
+        cageBtn:Disable()
+        warnText:SetText("Caging is unavailable during combat.")
+        return
+    end
 
     local sel = GetSelectedCount()
     if sel == 0 then
@@ -600,6 +664,7 @@ end
 UpdateSelectionCount = function()
     local sel = GetSelectedCount()
     local total = #scannedPets
+    cageBtn:SetText(sel > 0 and string.format("Cage %d Selected", sel) or "Cage Selected")
     listCountText:SetText(string.format("|cffffffff%d / %d selected|r", sel, total))
 
     if sel > 0 and not isCaging then
@@ -618,6 +683,7 @@ listSelNone:ClearAllPoints()
 listSelNone:SetPoint("LEFT", listSelAll, "RIGHT", 4, 0)
 
 listSelAll:SetScript("OnClick", function()
+    if isCaging then return end
     for _, pet in ipairs(scannedPets) do
         pet.selected = true
     end
@@ -626,6 +692,7 @@ listSelAll:SetScript("OnClick", function()
 end)
 
 listSelNone:SetScript("OnClick", function()
+    if isCaging then return end
     for _, pet in ipairs(scannedPets) do
         pet.selected = false
     end
@@ -633,340 +700,284 @@ listSelNone:SetScript("OnClick", function()
     UpdateSelectionCount()
 end)
 
----------------------------------------------------------------------------
--- Events
----------------------------------------------------------------------------
-local pendingScan = false
-
-frame:RegisterEvent("BAG_UPDATE")
-frame:RegisterEvent("PET_JOURNAL_LIST_UPDATE")
-frame:SetScript("OnEvent", function(self, event, ...)
-    if event == "BAG_UPDATE" and self:IsShown() then
-        CheckBagSpace()
-    elseif event == "PET_JOURNAL_LIST_UPDATE" and pendingScan then
-        pendingScan = false
-        self:PerformScan()
+-- Keep the native journal's source classification without leaving its filters changed.
+local function SourceMatches()
+    local all = true
+    for i = 1, C_PetJournal.GetNumPetSources() do
+        if filters.sources[i] == false then all = false end
     end
+    if all then return nil end
+    local saved = { search = C_PetJournal.GetSearchFilter(), types = {}, sources = {}, flags = {} }
+    for i = 1, C_PetJournal.GetNumPetTypes() do saved.types[i] = C_PetJournal.IsPetTypeChecked(i) end
+    for i = 1, C_PetJournal.GetNumPetSources() do saved.sources[i] = C_PetJournal.IsPetSourceChecked(i) end
+    for _, flag in ipairs({ LE_PET_JOURNAL_FILTER_COLLECTED, LE_PET_JOURNAL_FILTER_NOT_COLLECTED, LE_PET_JOURNAL_FILTER_FAVORITES }) do
+        saved.flags[flag] = C_PetJournal.IsFilterChecked(flag)
+    end
+    local matches = {}
+    local ok, err = pcall(function()
+        C_PetJournal.ClearSearchFilter()
+        C_PetJournal.SetFilterChecked(LE_PET_JOURNAL_FILTER_COLLECTED, true)
+        C_PetJournal.SetFilterChecked(LE_PET_JOURNAL_FILTER_NOT_COLLECTED, false)
+        C_PetJournal.SetFilterChecked(LE_PET_JOURNAL_FILTER_FAVORITES, false)
+        for i = 1, #saved.types do C_PetJournal.SetPetTypeFilter(i, true) end
+        for i = 1, #saved.sources do C_PetJournal.SetPetSourceChecked(i, filters.sources[i] ~= false) end
+        for i = 1, C_PetJournal.GetNumPets() do
+            local id = C_PetJournal.GetPetInfoByIndex(i)
+            if id then matches[id] = true end
+        end
+    end)
+    C_PetJournal.SetSearchFilter(saved.search)
+    for flag, value in pairs(saved.flags) do C_PetJournal.SetFilterChecked(flag, value) end
+    for i, value in ipairs(saved.types) do C_PetJournal.SetPetTypeFilter(i, value) end
+    for i, value in ipairs(saved.sources) do C_PetJournal.SetPetSourceChecked(i, value) end
+    if not ok then error(err) end
+    return matches
+end
+
+local function GetTeam()
+    local team = {}
+    for slot = 1, 3 do
+        local id = C_PetJournal.GetPetLoadOutInfo(slot)
+        if id then team[id] = true end
+    end
+    return team
+end
+
+local function ReadPet(id, team)
+    local info = C_PetJournal.GetPetInfoTableByPetID(id)
+    if not info then return nil end
+    local _, health, power, speed, rarity = C_PetJournal.GetPetStats(id)
+    return {
+        petID = id, speciesID = info.speciesID,
+        name = info.customName or info.name or "Unknown",
+        speciesName = info.name or "", level = info.petLevel or 1,
+        rarity = rarity or 0, petType = info.petType,
+        health = health or 0, power = power or 0, speed = speed or 0,
+        sourceText = info.sourceText,
+        protected = info.isFavorite or team[id] or
+            (filters.protectNamed and info.customName and info.customName ~= "") or
+            not C_PetJournal.PetIsTradable(id),
+    }
+end
+
+local function BuildCandidates()
+    local matches = SourceMatches()
+    local team, pets, counts, kept = GetTeam(), {}, {}, {}
+    for _, id in ipairs(C_PetJournal.GetOwnedPetIDs()) do
+        local pet = ReadPet(id, team)
+        if pet then
+            pets[#pets + 1] = pet
+            counts[pet.speciesID] = (counts[pet.speciesID] or 0) + 1
+            if pet.protected then kept[pet.speciesID] = (kept[pet.speciesID] or 0) + 1 end
+        end
+    end
+    -- Reserve strongest copies before applying sale filters; ties are stable.
+    table.sort(pets, function(a, b)
+        if a.level ~= b.level then return a.level > b.level end
+        if a.rarity ~= b.rarity then return a.rarity > b.rarity end
+        return a.petID < b.petID
+    end)
+    local result = {}
+    for _, pet in ipairs(pets) do
+        local species = pet.speciesID
+        pet.owned = counts[species]
+        if not pet.protected then
+            if (kept[species] or 0) < filters.keepCount then
+                kept[species] = (kept[species] or 0) + 1
+            elseif pet.owned >= filters.minDuplicates and filters.quality[pet.rarity]
+                and pet.level >= filters.levelMin and pet.level <= filters.levelMax
+                and filters.families[pet.petType] and (not matches or matches[pet.petID])
+                and (filters.search == "" or string.find(string.lower(pet.name .. " " .. pet.speciesName), filters.search, 1, true)) then
+                pet.selected = true
+                result[#result + 1] = pet
+            end
+        end
+    end
+    return result
+end
+
+MarkFiltersChanged = function()
+    scanDirty = true
+    CheckBagSpace()
+end
+
+local searchBox = CreateFrame("EditBox", nil, filterPanel, "InputBoxTemplate")
+searchBox:SetSize(260, 22)
+searchBox:SetPoint("TOPLEFT", filterPanel, "TOPLEFT", 52, 0)
+searchBox:SetAutoFocus(false)
+searchBox:SetMaxLetters(80)
+local searchLabel = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+searchLabel:SetPoint("RIGHT", searchBox, "LEFT", -8, 0)
+searchLabel:SetText("Search:")
+searchBox:SetScript("OnTextChanged", function(self)
+    filters.search = string.lower(self:GetText())
+    MarkFiltersChanged()
 end)
+searchBox:SetScript("OnEnterPressed", function(self) self:ClearFocus(); ScanPets() end)
+searchBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+controls[#controls + 1] = searchBox
+local namedCheck = CreateSmallCheck(filterPanel, "Keep custom-named pets", true, function(self)
+    filters.protectNamed = self:GetChecked()
+end)
+namedCheck:SetPoint("BOTTOMLEFT", filterPanel, "BOTTOMLEFT", 0, 26)
+local keepHint = filterPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+keepHint:SetPoint("BOTTOMLEFT", filterPanel, "BOTTOMLEFT", 4, 4)
+keepHint:SetText("Favorites and battle-team pets are kept. Keep rule: highest level, then quality.")
+controls[#controls + 1] = famSelAll
+controls[#controls + 1] = srcSelAll
+controls[#controls + 1] = listSelAll
+controls[#controls + 1] = listSelNone
 
----------------------------------------------------------------------------
--- Scan Logic
----------------------------------------------------------------------------
-function frame:PerformScan()
-    local numPets = C_PetJournal.GetNumPets()
+local emptyText = listBg:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+emptyText:SetPoint("CENTER")
+emptyText:SetWidth(540)
+emptyText:SetText("No matches. Try more qualities, a wider level range, or fewer copies to keep.")
+emptyText:Hide()
 
-    local speciesCount = {}
-    local petList = {}
-
-    for i = 1, numPets do
-        local petID, speciesID, owned, customName, level, favorite, isRevoked,
-              speciesName, icon, petType, companionID, tooltip, description,
-              isWild, canBattle, isTradeable, isUnique, obtainable =
-              C_PetJournal.GetPetInfoByIndex(i)
-
-        if petID and owned then
-            speciesCount[speciesID] = (speciesCount[speciesID] or 0) + 1
-
-            local _, _, _, _, rarity = C_PetJournal.GetPetStats(petID)
-
-            table.insert(petList, {
-                petID     = petID,
-                speciesID = speciesID,
-                name      = customName or speciesName or "Unknown",
-                level     = level or 1,
-                favorite  = favorite,
-                isRevoked = isRevoked,
-                rarity    = rarity or 2,
-                petType   = petType or 0,
-            })
-        end
-    end
-
-    -- Count how many of each species are UNcageable (favorite, revoked,
-    -- non-tradeable) -- these are automatic keeps that count toward keepCount.
-    local speciesUncageable = {}
-    for _, pet in ipairs(petList) do
-        if pet.favorite or pet.isRevoked or not C_PetJournal.PetIsTradable(pet.petID) then
-            speciesUncageable[pet.speciesID] = (speciesUncageable[pet.speciesID] or 0) + 1
-        end
-    end
-
-    -- Stamp owned count onto each pet for display
-    for _, pet in ipairs(petList) do
-        pet.owned = speciesCount[pet.speciesID] or 0
-    end
-
-    -- Sort by level DESCENDING so keepCount preserves the highest-level copies
-    table.sort(petList, function(a, b) return a.level > b.level end)
-
-    -- Calculate how many MORE we need to keep beyond the uncageable ones
-    -- e.g. keepCount=1, uncageable=0 -> need to reserve 1
-    -- e.g. keepCount=1, uncageable=2 -> already covered, reserve 0
-    local speciesKeptSoFar = {}
-
-    for _, pet in ipairs(petList) do
-        local dominated = false
-
-        -- Skip uncageable pets entirely (they're already kept by nature)
-        if pet.favorite or pet.isRevoked then
-            dominated = true
-        end
-
-        if not dominated then
-            if not C_PetJournal.PetIsTradable(pet.petID) then
-                dominated = true
-            end
-        end
-
-        if not dominated then
-            if not filters.quality[pet.rarity] then
-                dominated = true
-            end
-        end
-
-        if not dominated then
-            if pet.level < filters.levelMin or pet.level > filters.levelMax then
-                dominated = true
-            end
-        end
-
-        -- Use total species count (all owned) for minDuplicates check
-        if not dominated then
-            if (speciesCount[pet.speciesID] or 0) < filters.minDuplicates then
-                dominated = true
-            end
-        end
-
-        -- keepCount: account for uncageable copies that are already kept
-        if not dominated then
-            local uncageable = speciesUncageable[pet.speciesID] or 0
-            local needToKeep = math.max(0, filters.keepCount - uncageable)
-            speciesKeptSoFar[pet.speciesID] = (speciesKeptSoFar[pet.speciesID] or 0)
-            if speciesKeptSoFar[pet.speciesID] < needToKeep then
-                speciesKeptSoFar[pet.speciesID] = speciesKeptSoFar[pet.speciesID] + 1
-                dominated = true
-            end
-        end
-
-        if not dominated then
-            pet.selected = true
-            table.insert(scannedPets, pet)
-        end
-    end
-
-    SortScannedPets()
-
-    UpdateListRows()
-
-    local total = #scannedPets
-    if total > 0 then
-        statusText:SetText(string.format("Found %d cageable pets. Deselect any to keep.", total))
-    else
-        statusText:SetText("No cageable pets matched your filters.")
-    end
-
-    UpdateSelectionCount()
-    scanBtn:Enable()
-
-    -- If we just finished a cage batch, automatically continue caging
-    -- any newly eligible pets (e.g. 3 owned -> cage 2 in multiple passes)
-    if continueCagingAfterScan then
-        continueCagingAfterScan = false
-        local newSelected = GetSelectedPets()
-        if #newSelected > 0 and GetFreeBagSlots() >= #newSelected then
-            statusText:SetText(string.format(
-                "Found %d more eligible pets. Caging...", #newSelected))
-            C_Timer.After(0.5, function()
-                CageAllSelected()
-            end)
-        else
-            isCageLooping = false
-            if #newSelected > 0 then
-                statusText:SetText(string.format(
-                    "Caged %d pets total. %d more found but not enough bag space.",
-                    sessionCagedTotal, #newSelected))
-            else
-                statusText:SetText(string.format(
-                    "Done! Caged %d pets total. No more eligible pets.", sessionCagedTotal))
-            end
-        end
-    end
+local function SetBusy(busy)
+    for _, control in ipairs(controls) do control:SetEnabled(not busy) end
+    for _, row in ipairs(rowFrames) do row.check:SetEnabled(not busy) end
+    scanBtn:SetEnabled(not busy)
+    stopBtn:SetEnabled(busy)
+    if busy then cageBtn:Disable() end
 end
 
 ScanPets = function()
     if isCaging then return end
-
-    scannedPets = {}
-    scanBtn:Disable()
-    statusText:SetText("Scanning...")
-    progressText:SetText("")
-
-    C_PetJournal.ClearSearchFilter()
-    C_PetJournal.SetFilterChecked(LE_PET_JOURNAL_FILTER_COLLECTED, true)
-    C_PetJournal.SetFilterChecked(LE_PET_JOURNAL_FILTER_NOT_COLLECTED, false)
-
-    for i = 1, C_PetJournal.GetNumPetTypes() do
-        C_PetJournal.SetPetTypeFilter(i, filters.families[i] or false)
-    end
-
-    local numSources = C_PetJournal.GetNumPetSources()
-    for i = 1, numSources do
-        C_PetJournal.SetPetSourceChecked(i, filters.sources[i] or false)
-    end
-
-    pendingScan = true
-
-    C_Timer.After(0.5, function()
-        if pendingScan then
-            pendingScan = false
-            frame:PerformScan()
-        end
-    end)
-end
-
----------------------------------------------------------------------------
--- Cage Logic
----------------------------------------------------------------------------
-CageAllSelected = function()
-    if isCaging then return end
-
-    -- Reset session counter on first manual call (not during auto-continue loops)
-    if not isCageLooping then
-        sessionCagedTotal = 0
-        isCageLooping = true
-    end
-
-    local selected = GetSelectedPets()
-    if #selected == 0 then
-        statusText:SetText("No pets selected to cage.")
-        progressText:SetText("")
+    for _, input in ipairs({ levelMinInput, levelMaxInput, keepCountInput, minDupeInput }) do input.box:ClearFocus() end
+    if not C_PetJournal.GetOwnedPetIDs or not C_PetJournal.GetPetInfoTableByPetID then
+        statusText:SetText("This version requires the current Retail pet-journal API.")
         cageBtn:Disable()
         return
     end
-
-    local freeSlots = GetFreeBagSlots()
-    if freeSlots < #selected then
+    local ok, result = pcall(BuildCandidates)
+    if not ok then
+        scanDirty = true
         cageBtn:Disable()
-        warnText:SetTextColor(1, 0.3, 0.3)
-        warnText:SetText(string.format(
-            "Not enough bag space! Need %d slots, only %d free.",
-            #selected, freeSlots))
+        statusText:SetText("Could not read the pet journal. Reopen it and scan again.")
         return
     end
-
-    isCaging = true
-    scanBtn:Disable()
-    cageBtn:Disable()
-    stopBtn:Enable()
-
-    local totalToCage = #selected
-    local caged = 0
-    local cageIndex = 0
-
-    local function CageNext()
-        if not isCaging then
-            return
-        end
-
-        cageIndex = cageIndex + 1
-
-        if cageIndex > #selected then
-            isCaging = false
-            scanBtn:Enable()
-            stopBtn:Disable()
-
-            local remaining = {}
-            for _, pet in ipairs(scannedPets) do
-                if not pet._caged then
-                    table.insert(remaining, pet)
-                end
-            end
-            scannedPets = remaining
-            UpdateListRows()
-            UpdateSelectionCount()
-
-            sessionCagedTotal = sessionCagedTotal + caged
-            progressText:SetText("")
-            -- Re-scan after journal settles to pick up newly eligible pets
-            -- and automatically cage them if more are found (loop until done)
-            statusText:SetText(string.format("Caged %d pets. Re-scanning for more...", sessionCagedTotal))
-            continueCagingAfterScan = true
-            C_Timer.After(1.0, function()
-                ScanPets()
-            end)
-            return
-        end
-
-        local pet = selected[cageIndex]
-        if pet and pet.petID then
-            local speciesID = C_PetJournal.GetPetInfoByPetID(pet.petID)
-            if speciesID then
-                C_PetJournal.CagePetByID(pet.petID)
-                pet._caged = true
-                caged = caged + 1
-                progressText:SetText(string.format(
-                    "Caging... %d/%d  |  %s (Lv %d)",
-                    caged, totalToCage, pet.name, pet.level))
-            end
-        end
-
-        C_Timer.After(CAGE_DELAY, CageNext)
-    end
-
-    CageNext()
+    scannedPets = result
+    scanDirty = false
+    SortScannedPets()
+    scrollFrame:SetVerticalScroll(0)
+    UpdateListRows()
+    emptyText:SetShown(#scannedPets == 0)
+    UpdateSelectionCount()
+    statusText:SetText(string.format("%d eligible pets. Only checked pets will be caged.", #scannedPets))
 end
 
----------------------------------------------------------------------------
--- Stop
----------------------------------------------------------------------------
-local function StopCaging()
+local activeBatch
+local function FinishBatch(message)
+    local batch = activeBatch
+    batchToken = batchToken + 1
     isCaging = false
-    isCageLooping = false
-    continueCagingAfterScan = false
-    scanBtn:Enable()
-    stopBtn:Disable()
-
+    activeBatch = nil
     local remaining = {}
     for _, pet in ipairs(scannedPets) do
-        if not pet._caged then
-            table.insert(remaining, pet)
-        end
+        if not pet._caged then remaining[#remaining + 1] = pet end
     end
     scannedPets = remaining
+    SetBusy(false)
     UpdateListRows()
+    scanDirty = true
     UpdateSelectionCount()
-
-    statusText:SetText("Stopped.")
+    progressText:SetText(string.format("%d confirmed / %d selected", batch and batch.caged or 0, batch and #batch.pets or 0))
+    statusText:SetText(message)
 end
 
----------------------------------------------------------------------------
--- Wire up buttons
----------------------------------------------------------------------------
+StopCaging = function()
+    if activeBatch then
+        -- A request already sent cannot be recalled. Reconcile it before ending.
+        local pet = activeBatch.pending
+        if pet and not C_PetJournal.GetPetInfoTableByPetID(pet.petID) then
+            pet._caged = true
+            activeBatch.caged = activeBatch.caged + 1
+        end
+        FinishBatch("Stopped. Scan again to refresh your collection.")
+    end
+end
+
+CageAllSelected = function()
+    if isCaging or scanDirty or InCombatLockdown() then return end
+    local selected = GetSelectedPets()
+    if #selected == 0 or GetFreeBagSlots() < #selected then CheckBagSpace(); return end
+    -- Validate against a fresh collection without selecting any additional pets.
+    local ok, candidates = pcall(BuildCandidates)
+    if not ok then MarkFiltersChanged(); return end
+    local eligible = {}
+    for _, pet in ipairs(candidates) do eligible[pet.petID] = true end
+    for _, pet in ipairs(selected) do
+        if not eligible[pet.petID] then
+            MarkFiltersChanged()
+            statusText:SetText("Your collection changed. Scan and review before caging.")
+            return
+        end
+    end
+    batchToken = batchToken + 1
+    local token = batchToken
+    local batch = { pets = selected, index = 0, caged = 0 }
+    activeBatch = batch
+    isCaging = true
+    SetBusy(true)
+    local function NextPet()
+        if token ~= batchToken or not isCaging then return end
+        if InCombatLockdown() then FinishBatch("Stopped for combat. Scan again when ready."); return end
+        if batch.pending then
+            if not C_PetJournal.GetPetInfoTableByPetID(batch.pending.petID) then
+                batch.pending._caged = true
+                batch.caged = batch.caged + 1
+                batch.pending = nil
+            elseif GetTime() >= batch.deadline then
+                FinishBatch("Caging was not confirmed. Stopped; scan before retrying.")
+                return
+            else
+                C_Timer.After(CAGE_DELAY, NextPet)
+                return
+            end
+        end
+        batch.index = batch.index + 1
+        if batch.index > #selected then FinishBatch("Finished the selected batch. Scan to review more pets."); return end
+        local pet = selected[batch.index]
+        local current = ReadPet(pet.petID, GetTeam())
+        local owned = 0
+        for _, id in ipairs(C_PetJournal.GetOwnedPetIDs()) do
+            local info = C_PetJournal.GetPetInfoTableByPetID(id)
+            if info and info.speciesID == pet.speciesID then owned = owned + 1 end
+        end
+        if not current or current.protected or owned <= filters.keepCount then
+            FinishBatch("A selected pet is no longer eligible. Stopped; scan again.")
+            return
+        end
+        if GetFreeBagSlots() < 1 then FinishBatch("Bags are full. Stopped; make space and scan again."); return end
+        batch.pending = pet
+        batch.deadline = GetTime() + 5
+        progressText:SetText(string.format("%d / %d confirmed | Caging %s", batch.caged, #selected, pet.name))
+        local success = pcall(C_PetJournal.CagePetByID, pet.petID)
+        if not success and token == batchToken then FinishBatch("Cage request failed. Stopped; scan before retrying."); return end
+        C_Timer.After(CAGE_DELAY, NextPet)
+    end
+    NextPet()
+end
+
+frame:RegisterEvent("BAG_UPDATE_DELAYED")
+frame:RegisterEvent("PLAYER_REGEN_DISABLED")
+frame:RegisterEvent("PLAYER_REGEN_ENABLED")
+frame:RegisterEvent("PET_JOURNAL_CAGE_FAILED")
+frame:SetScript("OnEvent", function(_, event)
+    if event == "PET_JOURNAL_CAGE_FAILED" and isCaging then
+        FinishBatch("Blizzard could not cage this pet. Stopped; scan before retrying.")
+    elseif event == "PLAYER_REGEN_DISABLED" and isCaging then
+        StopCaging()
+    elseif frame:IsShown() then
+        CheckBagSpace()
+    end
+end)
 scanBtn:SetScript("OnClick", ScanPets)
 cageBtn:SetScript("OnClick", CageAllSelected)
 stopBtn:SetScript("OnClick", StopCaging)
-
--- Auto-scan on show
-frame:HookScript("OnShow", function()
-    ScanPets()
-end)
-
----------------------------------------------------------------------------
--- Slash commands
----------------------------------------------------------------------------
+frame:HookScript("OnShow", ScanPets)
+frame:HookScript("OnHide", StopCaging)
 SLASH_PETCAGER1 = "/petcager"
 SLASH_PETCAGER2 = "/pc"
-SlashCmdList["PETCAGER"] = function()
-    if frame:IsShown() then
-        frame:Hide()
-    else
-        frame:Show()
-    end
-end
-
----------------------------------------------------------------------------
--- Load message
----------------------------------------------------------------------------
-C_Timer.After(3, function()
-    print("|cff00ccffPet Cager|r loaded. Type |cff00ff00/pc|r or |cff00ff00/petcager|r to open.")
-end)
+SlashCmdList["PETCAGER"] = function() frame:SetShown(not frame:IsShown()) end
